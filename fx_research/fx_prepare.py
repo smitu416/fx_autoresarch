@@ -1,16 +1,18 @@
 """
-One-time data preparation for FX autoresearch experiments.
-Downloads USD/JPY daily OHLCV data from Yahoo Finance (2015-present),
-computes features, normalizes, and provides fixed evaluation metric.
+Data preparation for FX autoresearch — 4-hour swing trading.
+Downloads USD/JPY 1-hour data from Yahoo Finance, resamples to 4h OHLCV.
+Fixed constants and TP/SL backtest evaluation metric — do not modify.
 
-Fixed constants and evaluation metric — do not modify.
+Trading sessions (entry/exit only during these windows):
+  JST AM  6:00–9:00  = UTC 21:00–00:00  → 4h bar starting UTC 20:00
+  JST PM 22:00–00:00 = UTC 13:00–15:00  → 4h bar starting UTC 12:00
 
-Usage:
-    python fx_prepare.py
+Usage: python fx_prepare.py
 """
 
 import os
 import math
+from collections import namedtuple
 
 import numpy as np
 import pandas as pd
@@ -20,63 +22,95 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-LOOKBACK   = 60         # input sequence length (trading days)
-TIME_BUDGET = 300       # training time budget in seconds (5 minutes)
-TICKER     = "USDJPY=X"
-DATA_START = "2015-01-01"
-VAL_START  = "2023-01-01"   # held-out validation period
+LOOKBACK    = 30    # input window: 30 × 4h ≈ 5 trading days
+TIME_BUDGET = 300   # training time budget in seconds (5 minutes)
+N_FEATURES  = 12    # features per timestep
+MAX_HOLD    = 12    # max candles to hold trade before force-close (12 × 4h = 48h)
 
-N_FEATURES = 10  # number of features per timestep (see compute_features)
+# UTC bar-open hours that correspond to the JST trading windows
+# JST 6–9 AM  → UTC 21–24 (prev day)  → 4h bar opening at UTC 20:00
+# JST 22–24   → UTC 13–15             → 4h bar opening at UTC 12:00
+TRADING_BAR_UTC = {20, 12}   # only bars whose UTC hour is in this set are tradeable
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fx_autoresearch")
-DATA_FILE  = os.path.join(CACHE_DIR, "usdjpy.parquet")
+DATA_FILE  = os.path.join(CACHE_DIR, "usdjpy_4h.parquet")
+VAL_FRAC   = 0.2   # last 20 % of data held out for validation
+
+# Bundle of validation data returned by load_data()
+ValData = namedtuple("ValData", [
+    "x",            # (N, LOOKBACK, N_FEATURES)  float32 — feature sequences
+    "y",            # (N,)                        float32 — next-candle log return
+    "close",        # (N,)                        float32 — entry close price
+    "atr",          # (N,)                        float32 — ATR(14) at entry candle
+    "future_ohlc",  # (N, MAX_HOLD, 3)            float32 — [high, low, close] of next candles
+    "tradeable",    # (N,)                        bool    — True if candle in trading window
+])
 
 # ---------------------------------------------------------------------------
-# Data download
+# Download and resample
 # ---------------------------------------------------------------------------
 
 def download_data():
-    """Download USD/JPY daily data from Yahoo Finance and cache as parquet."""
+    """
+    Download USD/JPY 1h OHLCV from Yahoo Finance (max available ≈ 730 days),
+    resample to 4h, and cache as parquet.
+    """
     import yfinance as yf
     os.makedirs(CACHE_DIR, exist_ok=True)
     if os.path.exists(DATA_FILE):
         print(f"Data: already cached at {DATA_FILE}")
         return
-    print(f"Data: downloading {TICKER} from {DATA_START}...")
-    df = yf.download(TICKER, start=DATA_START, auto_adjust=True, progress=False)
+
+    print("Data: downloading USDJPY=X 1h (max available ~730 days)...")
+    df = yf.download("USDJPY=X", period="max", interval="1h",
+                     auto_adjust=True, progress=False)
     if df.empty:
-        raise RuntimeError(f"Failed to download data for {TICKER}")
-    df.to_parquet(DATA_FILE)
-    print(f"Data: saved {len(df)} rows to {DATA_FILE}")
+        raise RuntimeError("Failed to download USDJPY=X data from Yahoo Finance")
+
+    # Flatten MultiIndex columns that yfinance sometimes returns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Resample 1h → 4h (UTC-anchored at midnight: bars at 0,4,8,12,16,20 UTC)
+    df_4h = (
+        df.resample("4h")
+        .agg({"Open": "first", "High": "max", "Low": "min",
+              "Close": "last", "Volume": "sum"})
+        .dropna(subset=["Open", "High", "Low", "Close"])
+    )
+
+    df_4h.to_parquet(DATA_FILE)
+    print(f"Data: saved {len(df_4h)} 4h candles  "
+          f"({df_4h.index[0].date()} – {df_4h.index[-1].date()})")
+
 
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
 
-def compute_features(df: pd.DataFrame):
+def _compute_features_full(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute 10 features from OHLC DataFrame (Volume is ignored for FX).
+    Compute 12 features + target + raw ATR aligned to df's index.
+    Rows with insufficient history will contain NaN (filtered later).
 
-    Features:
-        0  log_ret    — daily log return
-        1  hl_range   — log(high/low) intraday range
-        2  co_change  — log(close/open)
-        3  ma5_dev    — close / 5-day MA - 1
-        4  ma20_dev   — close / 20-day MA - 1
-        5  ma60_dev   — close / 60-day MA - 1
-        6  rvol       — 20-day realized volatility of log returns
-        7  rsi_norm   — RSI(14) normalized to [-1, 1]
-        8  dow_sin    — day-of-week cyclical sine
-        9  dow_cos    — day-of-week cyclical cosine
+    Features (N_FEATURES = 12):
+        0  log_ret    daily 4h log return
+        1  hl_range   log(high/low) intraday range
+        2  co_change  log(close/open)
+        3  atr_norm   ATR(14) / close  (normalized ATR)
+        4  ma10_dev   close / MA(10) − 1  (≈ 1.7 trading days)
+        5  ma30_dev   close / MA(30) − 1  (≈ 5 days)
+        6  ma60_dev   close / MA(60) − 1  (≈ 10 days)
+        7  rvol       20-period realized volatility of log returns
+        8  rsi_norm   RSI(14) normalized to [−1, 1]
+        9  hour_sin   UTC hour cyclical sine
+        10 hour_cos   UTC hour cyclical cosine
+        11 dow_sin    day-of-week cyclical sine
 
-    Target: next-day log return (shifted -1).
-
-    Returns:
-        feat   : np.ndarray (T, N_FEATURES) float32
-        target : np.ndarray (T,)            float32 — next-day log return
-        dates  : pd.DatetimeIndex           (T,)
+    Extra columns (not features, used in simulation):
+        target      next-candle log return
+        atr         raw ATR(14) for TP/SL sizing
     """
-    # Flatten MultiIndex columns that yfinance sometimes returns
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
@@ -90,149 +124,277 @@ def compute_features(df: pd.DataFrame):
     hl_range  = np.log(high / low)
     co_change = np.log(close / open_)
 
-    ma5_dev  = close / close.rolling(5).mean()  - 1.0
-    ma20_dev = close / close.rolling(20).mean() - 1.0
+    # ATR(14) — average true range
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14    = tr.rolling(14).mean()
+    atr_norm = atr14 / close
+
+    ma10_dev = close / close.rolling(10).mean() - 1.0
+    ma30_dev = close / close.rolling(30).mean() - 1.0
     ma60_dev = close / close.rolling(60).mean() - 1.0
 
     rvol = log_ret.rolling(20).std()
 
-    # RSI(14): normalize to [-1, 1] (raw RSI is in [0, 1])
-    gain = log_ret.clip(lower=0).rolling(14).mean()
-    loss = (-log_ret.clip(upper=0)).rolling(14).mean()
+    gain     = log_ret.clip(lower=0).rolling(14).mean()
+    loss     = (-log_ret.clip(upper=0)).rolling(14).mean()
     rs       = gain / loss.replace(0.0, np.nan)
-    rsi_raw  = (rs / (1 + rs)).fillna(1.0)  # all-gain windows → RSI=1
-    rsi_norm = 2.0 * rsi_raw - 1.0
+    rsi      = (rs / (1 + rs)).fillna(1.0)
+    rsi_norm = 2.0 * rsi - 1.0
 
-    dow     = pd.Series(df.index.dayofweek, index=df.index, dtype=float)
-    dow_sin = np.sin(2.0 * np.pi * dow / 5.0)
-    dow_cos = np.cos(2.0 * np.pi * dow / 5.0)
+    # Cyclical time encodings
+    hour = pd.Series(df.index.hour,      index=df.index, dtype=float)
+    dow  = pd.Series(df.index.dayofweek, index=df.index, dtype=float)
+    hour_sin = np.sin(2.0 * np.pi * hour / 24.0)
+    hour_cos = np.cos(2.0 * np.pi * hour / 24.0)
+    dow_sin  = np.sin(2.0 * np.pi * dow  / 5.0)
 
-    features = pd.DataFrame({
+    result = pd.DataFrame({
         "log_ret":   log_ret,
         "hl_range":  hl_range,
         "co_change": co_change,
-        "ma5_dev":   ma5_dev,
-        "ma20_dev":  ma20_dev,
+        "atr_norm":  atr_norm,
+        "ma10_dev":  ma10_dev,
+        "ma30_dev":  ma30_dev,
         "ma60_dev":  ma60_dev,
         "rvol":      rvol,
         "rsi_norm":  rsi_norm,
+        "hour_sin":  hour_sin,
+        "hour_cos":  hour_cos,
         "dow_sin":   dow_sin,
-        "dow_cos":   dow_cos,
-    })
+        # extras
+        "target":    log_ret.shift(-1),
+        "atr":       atr14,
+    }, index=df.index)
 
-    # Target: next-day log return
-    target = log_ret.shift(-1).rename("target")
+    return result
 
-    combined = features.join(target).dropna()
-
-    feat_arr   = combined[features.columns].values.astype(np.float32)
-    target_arr = combined["target"].values.astype(np.float32)
-    dates      = combined.index
-
-    return feat_arr, target_arr, dates
+FEATURE_COLS = [
+    "log_ret", "hl_range", "co_change", "atr_norm",
+    "ma10_dev", "ma30_dev", "ma60_dev", "rvol",
+    "rsi_norm", "hour_sin", "hour_cos", "dow_sin",
+]
 
 # ---------------------------------------------------------------------------
-# Data loading (called by train.py)
+# Data loading
 # ---------------------------------------------------------------------------
 
 def load_data():
     """
-    Load, engineer features, normalize (train stats), and build sequences.
-
-    Normalization uses training-set mean/std only (no data leakage).
+    Load 4h data, compute features, normalize (train stats only),
+    build sliding-window sequences, and bundle validation data.
 
     Returns:
-        x_train : torch.Tensor (N_train, LOOKBACK, N_FEATURES)
-        y_train : torch.Tensor (N_train,)
-        x_val   : torch.Tensor (N_val,   LOOKBACK, N_FEATURES)
-        y_val   : torch.Tensor (N_val,)
+        x_train  (N_train, LOOKBACK, N_FEATURES)  float32
+        y_train  (N_train,)                        float32
+        val_data  ValData namedtuple
     """
     df = pd.read_parquet(DATA_FILE)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    feat_arr, target_arr, dates = compute_features(df)
+    # Remove timezone info to avoid comparison issues
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
 
-    val_mask = dates >= pd.Timestamp(VAL_START)
-    train_feat = feat_arr[~val_mask]
-    train_ret  = target_arr[~val_mask]
-    val_feat   = feat_arr[val_mask]
-    val_ret    = target_arr[val_mask]
+    full = _compute_features_full(df)
 
-    # Normalize using train statistics only
-    feat_mean = train_feat.mean(axis=0)
-    feat_std  = train_feat.std(axis=0) + 1e-8
-    train_feat_norm = (train_feat - feat_mean) / feat_std
-    val_feat_norm   = (val_feat   - feat_mean) / feat_std
+    # Valid rows: no NaN in any column
+    valid_mask = ~full.isnull().any(axis=1)
+    valid_idx  = np.where(valid_mask.values)[0]   # positions in original df
 
-    def make_sequences(feat, ret):
-        T = len(feat)
-        xs = np.stack([feat[i - LOOKBACK:i] for i in range(LOOKBACK, T)])
-        ys = ret[LOOKBACK:]
-        return torch.from_numpy(xs), torch.from_numpy(ys)
+    feat_df = full.loc[valid_mask]
+    feat_arr   = feat_df[FEATURE_COLS].values.astype(np.float32)  # (T, 12)
+    target_arr = feat_df["target"].values.astype(np.float32)      # (T,)
+    atr_arr    = feat_df["atr"].values.astype(np.float32)         # (T,)
+    close_arr  = df["Close"].values.astype(np.float32)[valid_idx] # (T,)
 
-    x_train, y_train = make_sequences(train_feat_norm, train_ret)
-    x_val,   y_val   = make_sequences(val_feat_norm,   val_ret)
+    T      = len(feat_arr)
+    T_full = len(df)
 
-    return x_train, y_train, x_val, y_val
+    # Tradeable flag: bar open-hour in TRADING_BAR_UTC
+    tradeable = np.array(
+        [feat_df.index[i].hour in TRADING_BAR_UTC for i in range(T)],
+        dtype=bool,
+    )
+
+    # Future OHLC for TP/SL simulation:
+    # future_ohlc[i, k] = [high, low, close] of the (k+1)-th candle after valid_idx[i]
+    hlc_full    = df[["High", "Low", "Close"]].values.astype(np.float32)
+    future_ohlc = np.zeros((T, MAX_HOLD, 3), dtype=np.float32)
+    for i, pos in enumerate(valid_idx):
+        end = min(pos + 1 + MAX_HOLD, T_full)
+        n   = end - (pos + 1)
+        if n > 0:
+            future_ohlc[i, :n] = hlc_full[pos + 1 : end]
+            if n < MAX_HOLD:
+                future_ohlc[i, n:] = hlc_full[end - 1]  # pad with last available
+
+    # Train / validation split
+    n_val   = max(1, int(T * VAL_FRAC))
+    n_train = T - n_val
+
+    # Normalize using training-set statistics only (no data leakage)
+    feat_mean = feat_arr[:n_train].mean(axis=0)
+    feat_std  = feat_arr[:n_train].std(axis=0) + 1e-8
+    feat_norm = (feat_arr - feat_mean) / feat_std
+
+    # Build sliding-window sequences
+    def _make_sequences(start, end):
+        indices = [t for t in range(start, end) if t >= LOOKBACK]
+        if not indices:
+            empty = np.zeros((0, LOOKBACK, N_FEATURES), dtype=np.float32)
+            return empty, np.zeros(0, dtype=np.float32), indices
+        xs = np.stack([feat_norm[t - LOOKBACK : t] for t in indices])
+        ys = target_arr[indices]
+        return xs, ys, indices
+
+    x_tr_np, y_tr_np, _         = _make_sequences(LOOKBACK, n_train)
+    x_val_np, y_val_np, val_seq = _make_sequences(n_train, T)
+
+    x_train = torch.from_numpy(x_tr_np)
+    y_train = torch.from_numpy(y_tr_np)
+
+    val_data = ValData(
+        x           = torch.from_numpy(x_val_np),
+        y           = torch.from_numpy(y_val_np),
+        close       = torch.from_numpy(close_arr[val_seq]),
+        atr         = torch.from_numpy(atr_arr[val_seq]),
+        future_ohlc = torch.from_numpy(future_ohlc[val_seq]),
+        tradeable   = torch.from_numpy(tradeable[val_seq]),
+    )
+
+    return x_train, y_train, val_data
+
 
 # ---------------------------------------------------------------------------
 # Dataloader
 # ---------------------------------------------------------------------------
 
 def make_dataloader(x: torch.Tensor, y: torch.Tensor, batch_size: int):
-    """
-    Infinite random-batch iterator over (x, y) tensors.
-
-    Yields:
-        x_batch : (batch_size, LOOKBACK, N_FEATURES)
-        y_batch : (batch_size,)
-    """
+    """Infinite random-batch iterator."""
     N = len(x)
-    indices = torch.randperm(N)
+    idx = torch.randperm(N)
     pos = 0
     while True:
         if pos + batch_size > N:
-            indices = torch.randperm(N)
+            idx = torch.randperm(N)
             pos = 0
-        idx = indices[pos:pos + batch_size]
-        pos += batch_size
-        yield x[idx], y[idx]
+        batch = idx[pos : pos + batch_size]
+        pos  += batch_size
+        yield x[batch], y[batch]
+
 
 # ---------------------------------------------------------------------------
-# Evaluation metric (DO NOT CHANGE — this is the fixed metric)
+# Evaluation metric — DO NOT MODIFY
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_sharpe(model, x_val: torch.Tensor, y_val: torch.Tensor,
-                    batch_size: int = 512) -> float:
+def evaluate_sharpe(
+    model,
+    val_data: ValData,
+    tp_mult: float = 2.0,
+    sl_mult: float = 1.0,
+    batch_size: int = 512,
+) -> float:
     """
-    Annualized Sharpe ratio on the validation set.
+    TP/SL backtest Sharpe ratio on the validation set.
 
-    Strategy:
-        signal[t] = model(x_val[t])       — scalar, any magnitude
-        daily_pnl[t] = signal[t] * y_val[t]   — proportional P&L
+    Only candles whose UTC open-hour is in TRADING_BAR_UTC are traded:
+      JST AM 6–9   → UTC bar at 20:00
+      JST PM 22–24 → UTC bar at 12:00
 
-    Annualized Sharpe = mean(daily_pnl) / std(daily_pnl) * sqrt(252)
-    Higher is better. Returns 0.0 if std is near zero.
+    For each tradeable candle t:
+      signal = model(x[t])
+        > 0 → LONG  : buy at close[t], TP = entry + ATR*tp_mult, SL = entry − ATR*sl_mult
+        < 0 → SHORT : sell at close[t], TP = entry − ATR*tp_mult, SL = entry + ATR*sl_mult
+
+      Scan future_ohlc[t, 0..MAX_HOLD-1]:
+        First candle where high ≥ TP (long) or low ≤ TP (short) → TP hit
+        First candle where low  ≤ SL (long) or high ≥ SL (short) → SL hit
+        If neither hit within MAX_HOLD candles → close at future_ohlc[t, -1, 2]
+
+      trade_pnl = direction × (exit_price − entry_price) / entry_price
+
+    Annualized Sharpe = mean(trade_pnl) / std(trade_pnl) × sqrt(N_annual)
+    where N_annual ≈ 2 sessions/day × 252 days = 504.
+    Returns 0.0 if fewer than 2 trades were executed.
     """
     model.eval()
-    all_signals = []
-    for start in range(0, len(x_val), batch_size):
-        xb = x_val[start:start + batch_size]
-        sig = model(xb).squeeze(-1)
-        all_signals.append(sig.cpu().float())
 
-    signals = torch.cat(all_signals)          # (N_val,)
-    returns = y_val.cpu().float()             # (N_val,)
+    # Get model signals for all validation sequences
+    signals = []
+    for start in range(0, len(val_data.x), batch_size):
+        xb  = val_data.x[start : start + batch_size]
+        sig = model(xb).squeeze(-1).cpu().float()
+        signals.append(sig)
+    signals = torch.cat(signals)   # (N_val,)
 
-    daily_pnl = signals * returns
+    trade_pnl = []
 
-    mean_pnl = daily_pnl.mean().item()
-    std_pnl  = daily_pnl.std().item()
+    for t in range(len(signals)):
+        if not val_data.tradeable[t].item():
+            continue
+
+        sig   = signals[t].item()
+        entry = val_data.close[t].item()
+        atr   = val_data.atr[t].item()
+
+        if entry <= 0 or atr <= 0:
+            continue
+
+        direction = 1 if sig >= 0 else -1  # +1 = long, -1 = short
+        tp_price  = entry + direction * atr * tp_mult
+        sl_price  = entry - direction * atr * sl_mult
+
+        # Default exit: close of last available candle
+        exit_price = val_data.future_ohlc[t, -1, 2].item()
+
+        for k in range(MAX_HOLD):
+            h = val_data.future_ohlc[t, k, 0].item()
+            l = val_data.future_ohlc[t, k, 1].item()
+            c = val_data.future_ohlc[t, k, 2].item()
+
+            if h == 0.0 and l == 0.0:
+                exit_price = c
+                break
+
+            if direction == 1:   # long
+                if h >= tp_price:
+                    exit_price = tp_price
+                    break
+                if l <= sl_price:
+                    exit_price = sl_price
+                    break
+            else:                # short
+                if l <= tp_price:
+                    exit_price = tp_price
+                    break
+                if h >= sl_price:
+                    exit_price = sl_price
+                    break
+
+        pnl = direction * (exit_price - entry) / entry
+        trade_pnl.append(pnl)
+
+    if len(trade_pnl) < 2:
+        return 0.0
+
+    arr      = np.array(trade_pnl, dtype=np.float64)
+    mean_pnl = arr.mean()
+    std_pnl  = arr.std()
 
     if std_pnl < 1e-10:
         return 0.0
 
-    return mean_pnl / std_pnl * math.sqrt(252)
+    # Annualized Sharpe: ~2 trading sessions × 252 trading days
+    ann_factor = math.sqrt(2 * 252)
+    return float(mean_pnl / std_pnl * ann_factor)
+
 
 # ---------------------------------------------------------------------------
 # Main (one-time setup)
@@ -241,12 +403,16 @@ def evaluate_sharpe(model, x_val: torch.Tensor, y_val: torch.Tensor,
 if __name__ == "__main__":
     download_data()
 
-    print("Verifying data and features...")
-    x_train, y_train, x_val, y_val = load_data()
+    print("\nVerifying data pipeline...")
+    x_train, y_train, val_data = load_data()
 
-    print(f"Train sequences : {len(x_train):,}  ({len(x_train)} trading days)")
-    print(f"Val   sequences : {len(x_val):,}   (from {VAL_START})")
-    print(f"Sequence shape  : {tuple(x_train.shape[1:])}  (lookback={LOOKBACK}, features={N_FEATURES})")
-    print(f"Val return mean : {y_val.mean():.6f},  std: {y_val.std():.6f}")
+    n_tradeable = int(val_data.tradeable.sum().item())
+    print(f"Train sequences : {len(x_train):,}")
+    print(f"Val   sequences : {len(val_data.x):,}  (tradeable: {n_tradeable:,})")
+    print(f"Sequence shape  : {tuple(val_data.x.shape[1:])}  "
+          f"(lookback={LOOKBACK}, features={N_FEATURES})")
+    print(f"Val return mean : {val_data.y.mean():.6f},  "
+          f"std: {val_data.y.std():.6f}")
+    print(f"ATR mean        : {val_data.atr.mean():.4f} JPY")
     print()
     print("Done! Ready to train.")
